@@ -1,19 +1,20 @@
 import { Injectable, Logger } from '@nestjs/common';
 
 import {
-  JobRepository,
   NotificationTemplateEntity,
   NotificationTemplateRepository,
   IntegrationRepository,
+  EnvironmentRepository,
 } from '@novu/dal';
 import {
+  buildWorkflowPreferences,
   ChannelTypeEnum,
   InAppProviderIdEnum,
   ISubscribersDefine,
   ProvidersIdEnum,
   STEP_TYPE_TO_CHANNEL_TYPE,
+  WorkflowTypeEnum,
 } from '@novu/shared';
-import { StoreSubscriberJobs, StoreSubscriberJobsCommand } from '../store-subscriber-jobs';
 import {
   AnalyticsService,
   ApiException,
@@ -26,8 +27,8 @@ import {
   PinoLogger,
   ProcessSubscriber,
   ProcessSubscriberCommand,
-  ProcessTenant,
 } from '@novu/application-generic';
+import { StoreSubscriberJobs, StoreSubscriberJobsCommand } from '../store-subscriber-jobs';
 import { SubscriberJobBoundCommand } from './subscriber-job-bound.command';
 
 const LOG_CONTEXT = 'SubscriberJobBoundUseCase';
@@ -39,6 +40,7 @@ export class SubscriberJobBound {
     private createNotificationJobs: CreateNotificationJobs,
     private processSubscriber: ProcessSubscriber,
     private integrationRepository: IntegrationRepository,
+    private environmentRepository: EnvironmentRepository,
     private notificationTemplateRepository: NotificationTemplateRepository,
     private logger: PinoLogger,
     private analyticsService: AnalyticsService
@@ -63,13 +65,14 @@ export class SubscriberJobBound {
       identifier,
       _subscriberSource,
       requestCategory,
+      environmentName,
     } = command;
 
     const template =
       this.mapBridgeWorkflow(command) ??
       (await this.getNotificationTemplate({
         _id: templateId,
-        environmentId: environmentId,
+        environmentId,
       }));
 
     if (!template) {
@@ -83,11 +86,13 @@ export class SubscriberJobBound {
     /**
      * Due to Mixpanel HotSharding, we don't want to pass userId for production volume
      */
-    const segmentUserId = ['test-workflow', 'digest-playground'].includes(command.payload.__source) ? userId : '';
+    const segmentUserId = ['test-workflow', 'digest-playground', 'dashboard'].includes(command.payload.__source)
+      ? userId
+      : '';
 
     this.analyticsService.mixpanelTrack('Notification event trigger - [Triggers]', segmentUserId, {
       name: template.name,
-      type: template?.type || 'REGULAR',
+      type: template?.type || WorkflowTypeEnum.REGULAR,
       transactionId: command.transactionId,
       _template: template._id,
       _organization: command.organizationId,
@@ -95,6 +100,8 @@ export class SubscriberJobBound {
       source: command.payload.__source || 'api',
       subscriberSource: _subscriberSource || null,
       requestCategory: requestCategory || null,
+      environmentName,
+      statelessWorkflow: !!command.bridge?.url,
     });
 
     const subscriberProcessed = await this.processSubscriber.execute(
@@ -108,11 +115,6 @@ export class SubscriberJobBound {
 
     // If no subscriber makes no sense to try to create notification
     if (!subscriberProcessed) {
-      /**
-       * TODO: Potentially add a CreateExecutionDetails entry. Right now we
-       * have the limitation we need a job to be created for that. Here there
-       * is no job at this point.
-       */
       Logger.warn(
         `Subscriber ${JSON.stringify(subscriber.subscriberId)} of organization ${
           command.organizationId
@@ -136,7 +138,17 @@ export class SubscriberJobBound {
       transactionId: command.transactionId,
       userId,
       tenant,
-      bridge: command.bridge,
+      bridgeUrl: command.bridge?.url,
+      /*
+       * Only populate preferences if the command contains a `bridge` property,
+       * indicating that the execution is stateless.
+       *
+       * TODO: refactor the Worker execution to handle both stateless and stateful workflows
+       * transparently.
+       */
+      ...(command.bridge?.workflow && {
+        preferences: buildWorkflowPreferences(command.bridge?.workflow?.preferences),
+      }),
     };
 
     if (actor) {
@@ -152,7 +164,6 @@ export class SubscriberJobBound {
         environmentId: command.environmentId,
         jobs: notificationJobs,
         organizationId: command.organizationId,
-        bridge: command.bridge,
       })
     );
   }
@@ -170,10 +181,14 @@ export class SubscriberJobBound {
      */
     return {
       ...bridgeWorkflow,
-      type: 'ECHO',
+      type: WorkflowTypeEnum.BRIDGE,
       steps: bridgeWorkflow.steps.map((step) => {
+        const stepControlVariables = command.controls?.steps?.[step.stepId];
+
         return {
           ...step,
+          bridgeUrl: command.bridge?.url,
+          controlVariables: stepControlVariables,
           active: true,
           template: {
             type: step.type,
@@ -228,6 +243,7 @@ export class SubscriberJobBound {
   ): Promise<Record<ChannelTypeEnum, ProvidersIdEnum>> {
     const providers = {} as Record<ChannelTypeEnum, ProvidersIdEnum>;
 
+    // eslint-disable-next-line no-unsafe-optional-chaining
     for (const step of template?.steps) {
       const type = step.template?.type;
       if (!type) continue;

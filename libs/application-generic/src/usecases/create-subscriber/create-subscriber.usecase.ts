@@ -1,22 +1,26 @@
-import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
-import { SubscriberRepository } from '@novu/dal';
-import { SubscriberEntity, ErrorCodesEnum } from '@novu/dal';
-
+import { Injectable } from '@nestjs/common';
 import {
+  ErrorCodesEnum,
+  SubscriberEntity,
+  SubscriberRepository,
+} from '@novu/dal';
+
+import { AnalyticsService } from '../../services/analytics.service';
+import {
+  buildSubscriberKey,
   CachedEntity,
   InvalidateCacheService,
-  buildSubscriberKey,
 } from '../../services/cache';
-import { CreateSubscriberCommand } from './create-subscriber.command';
-import {
-  UpdateSubscriber,
-  UpdateSubscriberCommand,
-} from '../update-subscriber';
 import {
   OAuthHandlerEnum,
   UpdateSubscriberChannel,
   UpdateSubscriberChannelCommand,
 } from '../subscribers';
+import {
+  UpdateSubscriber,
+  UpdateSubscriberCommand,
+} from '../update-subscriber';
+import { CreateSubscriberCommand } from './create-subscriber.command';
 
 @Injectable()
 export class CreateSubscriber {
@@ -24,7 +28,8 @@ export class CreateSubscriber {
     private invalidateCache: InvalidateCacheService,
     private subscriberRepository: SubscriberRepository,
     private updateSubscriber: UpdateSubscriber,
-    private updateSubscriberChannel: UpdateSubscriberChannel
+    private updateSubscriberChannel: UpdateSubscriberChannel,
+    private analyticsService: AnalyticsService,
   ) {}
 
   async execute(command: CreateSubscriberCommand) {
@@ -38,8 +43,23 @@ export class CreateSubscriber {
     if (!subscriber) {
       subscriber = await this.createSubscriber(command);
 
+      this.analyticsService.mixpanelTrack('Subscriber Created', '', {
+        _organization: command.organizationId,
+        hasEmail: !!command.email,
+        hasPhone: !!command.phone,
+        hasAvatar: !!command.avatar,
+        hasLocale: !!command.locale,
+        hasData: !!command.data,
+        hasCredentials: !!command.channels,
+      });
+
       if (command.channels?.length) {
         await this.updateCredentials(command);
+        // fetch subscriber again as channel credentials are updated
+        subscriber = await this.fetchSubscriber({
+          _environmentId: command.environmentId,
+          subscriberId: command.subscriberId,
+        });
       }
     } else {
       subscriber = await this.updateSubscriber.execute(
@@ -56,7 +76,7 @@ export class CreateSubscriber {
           data: command.data,
           subscriber,
           channels: command.channels,
-        })
+        }),
       );
     }
 
@@ -75,7 +95,7 @@ export class CreateSubscriber {
           integrationIdentifier: channel.integrationIdentifier,
           oauthHandler: OAuthHandlerEnum.EXTERNAL,
           isIdempotentOperation: false,
-        })
+        }),
       );
     }
   }
@@ -135,7 +155,7 @@ export class CreateSubscriber {
     return await this.subscriberRepository.findBySubscriberId(
       _environmentId,
       subscriberId,
-      true
+      true,
     );
   }
 }
